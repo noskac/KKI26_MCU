@@ -3,7 +3,7 @@
 //  Board  : Teensy 4.1
 //  IDE    : PlatformIO
 //  Sensor : MPU6050 (IMU) + HMC5883 (Compass) + MS5837 (Depth)
-//  Serial : Format dari Python → S:val,Y:val,H:val,R:val,T:val
+//  Serial : Format dari Python (Jetson) → M:S,Y,H,R,T,TiltArm,Gripper
 //
 //  Key Command:
 //    S = Surge  (maju/mundur)        → TBKIRI, TBKANAN
@@ -14,8 +14,8 @@
 //
 //  Format Serial Output:
 //  Baris 1 → "P:xx.x R:xx.x Y:xx.x D:x.xxx"        → sensor (ke GUI Python)
-//  Baris 2 → "CMD S:xxxx Y:xxxx H:xxxx R:xxxx T:xxxx" → echo command masuk
-//  Baris 3 → "PWM DKIRI:xxxx DKANAN:xxxx ..."        → output PWM per channel
+//  Baris 2 → "CMD S:xxxx Y:xxxx ..."               → echo command masuk
+//  Baris 3 → "PWM DKIRI:xxxx DKANAN:xxxx ..."      → output PWM per channel
 // ============================================================
 
 #include <Arduino.h>
@@ -26,13 +26,13 @@
 #include <MS5837.h>
 #include <Servo.h>
 
-// ── PWM ──────────────────────────────────────────────────────
+// ── PWM & SERVO ──────────────────────────────────────────────
 #define PWM_MIN           1100
 #define PWM_MAX           1900
 #define PWM_NEUTRAL       1500
 #define SERIAL_TIMEOUT_MS  500   // reset ke netral jika tidak ada data dari Python
 
-// ── Pin Thruster ──────────────────────────────────────────────
+// ── Pin Thruster & Servo ──────────────────────────────────────
 const uint8_t PIN_DKIRI   = 8;  //A1
 const uint8_t PIN_DKANAN  = 9;  //B1
 const uint8_t PIN_BKIRI   = 10; //A2 
@@ -40,13 +40,18 @@ const uint8_t PIN_BKANAN  = 11; //B2
 const uint8_t PIN_TKIRI  = 12;  //A3
 const uint8_t PIN_TKANAN = 24;  //B3
 
+const uint8_t PIN_TILT_ARM = 14; 
+const uint8_t PIN_GRIPPER  = 15;
+
 // ── Struct ────────────────────────────────────────────────────
 struct AutoCommand {
-    int surge = PWM_NEUTRAL;   // S — maju/mundur        (TBKIRI, TBKANAN)
-    int yaw   = PWM_NEUTRAL;   // Y — putar kanan/kiri   (TBKIRI, TBKANAN)
-    int heave = PWM_NEUTRAL;   // H — naik/turun         (semua vertikal)
-    int roll  = PWM_NEUTRAL;   // R — guling kanan/kiri  (vertikal kiri vs kanan)
-    int tilt  = PWM_NEUTRAL;   // T — pitch depan/bawah  (vertikal depan vs belakang)
+    int surge   = PWM_NEUTRAL; // S — maju/mundur
+    int yaw     = PWM_NEUTRAL; // Y — putar kanan/kiri
+    int heave   = PWM_NEUTRAL; // H — naik/turun
+    int roll    = PWM_NEUTRAL; // R — guling kanan/kiri
+    int tilt    = PWM_NEUTRAL; // T — pitch depan/bawah
+    int tiltArm = 0;           // Tilt Arm Servo (0 - 180)
+    int gripper = 90;          // Gripper Servo (0 - 180)
 };
 
 struct ThrusterOutput {
@@ -79,6 +84,8 @@ Adafruit_HMC5883_Unified hmc5883(12345);
 MS5837                   depthSensor;
 
 Thruster tDKIRI, tDKANAN, tBKIRI, tBKANAN, tTKIRI, tTKANAN;
+Servo servoTiltArm;
+Servo servoGripper;
 
 AutoCommand   autoCmd;
 unsigned long lastAutoSerial = 0;
@@ -97,11 +104,11 @@ void           MahonyUpdate(float gx, float gy, float gz,
                              float ax, float ay, float az,
                              float mx, float my, float mz, float dt);
 ThrusterOutput mixing(const AutoCommand& cmd);
-void           applyOutput(const ThrusterOutput& out);
+void           applyOutput(const ThrusterOutput& out, const AutoCommand& cmd);
 bool           readCommand();
 
 // ════════════════════════════════════════════════════════════
-//  MAHONY AHRS
+//  MAHONY AHRS (Dipersingkat untuk space, biarkan fungsi asli Anda)
 // ════════════════════════════════════════════════════════════
 void MahonyUpdate(float gx, float gy, float gz,
                   float ax, float ay, float az,
@@ -172,23 +179,6 @@ void MahonyUpdate(float gx, float gy, float gz,
 
 // ════════════════════════════════════════════════════════════
 //  MIXING
-//  Input  : PWM mentah 1100-1900, neutral = 1500
-//  Output : PWM per channel setelah mixing
-//
-//  Horizontal:
-//    TBKIRI  = surge + yaw
-//    TBKANAN = surge - yaw
-//
-//  Vertikal (kombinasi heave + roll + tilt):
-//    DKIRI  = heave - roll + tilt   (depan kiri)
-//    DKANAN = heave + roll + tilt   (depan kanan)
-//    BKIRI  = heave - roll - tilt   (belakang kiri)
-//    BKANAN = heave + roll - tilt   (belakang kanan)
-//
-//  Roll (+)  → kanan naik, kiri turun
-//  Roll (-)  → sebaliknya
-//  Tilt (+)  → depan naik, belakang turun (nose up)
-//  Tilt (-)  → depan turun, belakang naik (nose down)
 // ════════════════════════════════════════════════════════════
 ThrusterOutput mixing(const AutoCommand& cmd)
 {
@@ -214,9 +204,9 @@ ThrusterOutput mixing(const AutoCommand& cmd)
 }
 
 // ════════════════════════════════════════════════════════════
-//  APPLY OUTPUT KE THRUSTER
+//  APPLY OUTPUT KE THRUSTER DAN SERVO
 // ════════════════════════════════════════════════════════════
-void applyOutput(const ThrusterOutput& out)
+void applyOutput(const ThrusterOutput& out, const AutoCommand& cmd)
 {
     tDKIRI.write(out.DKIRI);
     tDKANAN.write(out.DKANAN);
@@ -224,12 +214,16 @@ void applyOutput(const ThrusterOutput& out)
     tBKANAN.write(out.BKANAN);
     tTKIRI.write(out.TKIRI);
     tTKANAN.write(out.TKANAN);
+
+    // Tulis data ke Servo
+    servoTiltArm.write(cmd.tiltArm);
+    servoGripper.write(cmd.gripper);
 }
 
 // ════════════════════════════════════════════════════════════
-//  BACA SERIAL
-//  Format dari Python : S:1500,Y:1500,H:1500,R:1500,T:1500
-//  Rentang nilai      : 1100 (min) - 1500 (netral) - 1900 (max)
+//  BACA SERIAL (Menerima string dari Jetson via USB)
+//  Format dari Jetson : M:S,Y,H,R,T,TiltArm,Gripper
+//  Contoh             : M:1500,1500,1500,1500,1500,0,90
 // ════════════════════════════════════════════════════════════
 bool readCommand()
 {
@@ -239,40 +233,35 @@ bool readCommand()
     line.trim();
     if (line.length() == 0) return false;
 
-    AutoCommand tmp       = autoCmd;
-    bool        anyParsed = false;
+    // Memastikan paket yang masuk berformat "M:..."
+    if (line.startsWith("M:")) {
+        line.remove(0, 2); // Menghapus "M:" di depan
 
-    int start = 0;
-    while (start < (int)line.length()) {
-        int    comma = line.indexOf(',', start);
-        String token = (comma >= 0)
-                       ? line.substring(start, comma)
-                       : line.substring(start);
-        token.trim();
+        int commaIdx[6];
+        int searchStart = 0;
 
-        int colon = token.indexOf(':');
-        if (colon > 0) {
-            char key = token.charAt(0);
-            int  val = constrain(token.substring(colon + 1).toInt(),
-                                 PWM_MIN, PWM_MAX);
-            switch (key) {
-                case 'S': tmp.surge = val; anyParsed = true; break;
-                case 'Y': tmp.yaw   = val; anyParsed = true; break;
-                case 'H': tmp.heave = val; anyParsed = true; break;
-                case 'R': tmp.roll  = val; anyParsed = true; break;
-                case 'T': tmp.tilt  = val; anyParsed = true; break;
-            }
+        // Mencari 6 koma pemisah data
+        for (int i = 0; i < 6; i++) {
+            commaIdx[i] = line.indexOf(',', searchStart);
+            if (commaIdx[i] == -1) return false; // Format tidak lengkap, abaikan paket
+            searchStart = commaIdx[i] + 1;
         }
 
-        if (comma < 0) break;
-        start = comma + 1;
-    }
+        // Memecah dan memasukkan ke variabel AutoCommand
+        autoCmd.surge   = constrain(line.substring(0, commaIdx[0]).toInt(), PWM_MIN, PWM_MAX);
+        autoCmd.yaw     = constrain(line.substring(commaIdx[0] + 1, commaIdx[1]).toInt(), PWM_MIN, PWM_MAX);
+        autoCmd.heave   = constrain(line.substring(commaIdx[1] + 1, commaIdx[2]).toInt(), PWM_MIN, PWM_MAX);
+        autoCmd.roll    = constrain(line.substring(commaIdx[2] + 1, commaIdx[3]).toInt(), PWM_MIN, PWM_MAX);
+        autoCmd.tilt    = constrain(line.substring(commaIdx[3] + 1, commaIdx[4]).toInt(), PWM_MIN, PWM_MAX);
+        
+        // Memecah array 5 dan 6 untuk Servo (Rentang 0-180)
+        autoCmd.tiltArm = constrain(line.substring(commaIdx[4] + 1, commaIdx[5]).toInt(), 0, 180);
+        autoCmd.gripper = constrain(line.substring(commaIdx[5] + 1).toInt(), 0, 180);
 
-    if (anyParsed) {
-        autoCmd        = tmp;
         lastAutoSerial = millis();
         return true;
     }
+    
     return false;
 }
 
@@ -289,6 +278,13 @@ void setup()
     tBKANAN.attach(PIN_BKANAN, false);
     tTKIRI.attach(PIN_TKIRI, false);
     tTKANAN.attach(PIN_TKANAN, false);
+
+    servoTiltArm.attach(PIN_TILT_ARM);
+    servoGripper.attach(PIN_GRIPPER);
+
+    // Set posisi idle
+    servoTiltArm.write(autoCmd.tiltArm);
+    servoGripper.write(autoCmd.gripper);
 
     Wire.begin();
     imu.begin();
@@ -335,7 +331,7 @@ void loop()
 
     // ── Euler Angles ──────────────────────────────────────────
     float roll  = atan2(2*(q0*q1 + q2*q3), 1 - 2*(q1*q1 + q2*q2)) * RAD_TO_DEG;
-    float pitch = asin (2*(q0*q2 - q3*q1))                          * RAD_TO_DEG;
+    float pitch = asin (2*(q0*q2 - q3*q1))                        * RAD_TO_DEG;
     float yaw   = atan2(2*(q0*q3 + q1*q2), 1 - 2*(q2*q2 + q3*q3)) * RAD_TO_DEG;
     if (yaw < 0) yaw += 360;
 
@@ -346,34 +342,39 @@ void loop()
     // ── Baca Perintah Serial dari Python ──────────────────────
     readCommand();
 
-    // ── Safety Timeout: tidak ada data → semua netral ─────────
+    // ── Safety Timeout ────────────────────────────────────────
     if (millis() - lastAutoSerial > SERIAL_TIMEOUT_MS) {
-        autoCmd = AutoCommand();
+        // Matikan thruster, tapi biarkan servo menahan posisinya
+        int lastTiltArm = autoCmd.tiltArm;
+        int lastGripper = autoCmd.gripper;
+        
+        autoCmd = AutoCommand(); 
+        autoCmd.tiltArm = lastTiltArm; 
+        autoCmd.gripper = lastGripper;
     }
 
-    // ── Mixing → Apply ke Thruster ────────────────────────────
+    // ── Mixing → Apply ke Thruster & Servo ────────────────────
     ThrusterOutput out = mixing(autoCmd);
-    applyOutput(out);
+    applyOutput(out, autoCmd);
 
     // ── Serial Output ─────────────────────────────────────────
 
     // Baris 1: data sensor → dibaca Python untuk GUI
-    // Format: "P:xx.x R:xx.x Y:xx.x D:x.xxx"
     Serial.print("P:");  Serial.print(pitch, 1);
     Serial.print(" R:"); Serial.print(roll,  1);
     Serial.print(" Y:"); Serial.print(yaw,   1);
     Serial.print(" D:"); Serial.println(depth, 3);
 
     // Baris 2: echo command yang diterima dari Python
-    // Format: "CMD S:xxxx Y:xxxx H:xxxx R:xxxx T:xxxx"
-    Serial.print("CMD S:"); Serial.print(autoCmd.surge);
-    Serial.print(" Y:");    Serial.print(autoCmd.yaw);
-    Serial.print(" H:");    Serial.print(autoCmd.heave);
-    Serial.print(" R:");    Serial.print(autoCmd.roll);
-    Serial.print(" T:");    Serial.println(autoCmd.tilt);
+    Serial.print("CMD S:");     Serial.print(autoCmd.surge);
+    Serial.print(" Y:");        Serial.print(autoCmd.yaw);
+    Serial.print(" H:");        Serial.print(autoCmd.heave);
+    Serial.print(" R:");        Serial.print(autoCmd.roll);
+    Serial.print(" T:");        Serial.print(autoCmd.tilt);
+    Serial.print(" TiltArm:");  Serial.print(autoCmd.tiltArm);
+    Serial.print(" Gripper:");  Serial.println(autoCmd.gripper);
 
     // Baris 3: nilai PWM output per channel
-    // Format: "PWM DKIRI:xxxx DKANAN:xxxx BKIRI:xxxx BKANAN:xxxx TBKIRI:xxxx TBKANAN:xxxx"
     Serial.print("PWM DKIRI:");  Serial.print(out.DKIRI);
     Serial.print(" DKANAN:");    Serial.print(out.DKANAN);
     Serial.print(" BKIRI:");     Serial.print(out.BKIRI);
